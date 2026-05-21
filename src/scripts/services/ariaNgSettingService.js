@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    angular.module('ariaNg').factory('ariaNgSettingService', ['$window', '$location', '$filter', 'ariaNgConstants', 'ariaNgDefaultOptions', 'ariaNgLanguages', 'ariaNgCommonService', 'ariaNgLogService', 'ariaNgStorageService', function ($window, $location, $filter, ariaNgConstants, ariaNgDefaultOptions, ariaNgLanguages, ariaNgCommonService, ariaNgLogService, ariaNgStorageService) {
+    angular.module('ariaNg').factory('ariaNgSettingService', ['$window', '$location', '$filter', 'ariaNgConstants', 'ariaNgDefaultOptions', 'ariaNgLanguages', 'ariaNgCommonService', 'ariaNgLogService', 'ariaNgStorageService', 'ariaNgWebView2Service', function ($window, $location, $filter, ariaNgConstants, ariaNgDefaultOptions, ariaNgLanguages, ariaNgCommonService, ariaNgLogService, ariaNgStorageService, ariaNgWebView2Service) {
         var browserFeatures = (function () {
             var supportLocalStroage = ariaNgStorageService.isLocalStorageSupported();
             var supportCookies = ariaNgStorageService.isCookiesSupported();
@@ -18,8 +18,16 @@
             && $window.matchMedia('(prefers-color-scheme: dark)').media !== 'not all'
             && angular.isFunction($window.matchMedia('(prefers-color-scheme: dark)').addEventListener);
 
+        // 首次访问回调相关变量
         var onFirstVisitCallbacks = [];
         var firstVisitCallbackFired = false;
+
+        // ===== WebView2 Secret 自动填充相关 =====
+        // 是否已发起过 WebView2 secret 请求（保证整个生命周期只请求一次）
+        var hasRequestedWebView2Secret = false;
+        // secret 就绪的 promise，供 aria2RpcService 等待 secret 加载完成
+        // null 表示非 WebView2 环境或不需要请求
+        var webView2SecretReadyPromise = null;
         var sessionSettings = {
             debugMode: false
         };
@@ -154,6 +162,7 @@
                 options.language = getLanguageNameFromAliasOrDefaultLanguage(options.language);
             }
 
+            // 首次访问：初始化默认配置
             if (!options) {
                 options = angular.extend({}, ariaNgDefaultOptions);
                 options.language = getDefaultLanguage();
@@ -174,6 +183,59 @@
 
                 setOptions(options);
                 fireFirstVisitEvent();
+            }
+
+            // ===== WebView2 RPC Secret 自动填充 =====
+            // 无论是否首次访问，只要还没请求过 secret，就发起请求
+            // 这样可以确保每次新启动应用时都能获取到最新的 secret
+            if (!hasRequestedWebView2Secret) {
+                hasRequestedWebView2Secret = true;
+
+                // 将 promise 缓存起来，供 aria2RpcService 等待 secret 就绪
+                webView2SecretReadyPromise = (function () {
+                    // 非 WebView2 环境，跳过
+                    if (!ariaNgWebView2Service.isAvailable()) {
+                        return null;
+                    }
+
+                    // 只对 localhost / 127.0.0.1 的 RPC 配置自动填充 secret
+                    var host = options.rpcHost;
+                    if (host !== 'localhost' && host !== '127.0.0.1') {
+                        return null;
+                    }
+
+                    // 请求 secret，收到后自动写入 storage
+                    return ariaNgWebView2Service.requestRpcSecret().then(function (secret) {
+                        if (!secret) {
+                            // 获取失败或超时，静默忽略
+                            return null;
+                        }
+
+                        var encodedSecret = ariaNgCommonService.base64Encode(secret);
+
+                        // 从 storage 读取最新配置并更新 secret
+                        var currentOpts = ariaNgStorageService.get(ariaNgConstants.optionStorageKey);
+                        if (currentOpts) {
+                            // 更新默认 RPC 配置的 secret
+                            currentOpts.secret = encodedSecret;
+
+                            // 更新所有 localhost/127.0.0.1 的扩展 RPC 配置的 secret
+                            if (angular.isArray(currentOpts.extendRpcServers) && currentOpts.extendRpcServers.length > 0) {
+                                for (var i = 0; i < currentOpts.extendRpcServers.length; i++) {
+                                    var rpcHost = currentOpts.extendRpcServers[i].rpcHost;
+                                    if (rpcHost === 'localhost' || rpcHost === '127.0.0.1') {
+                                        currentOpts.extendRpcServers[i].secret = encodedSecret;
+                                    }
+                                }
+                            }
+
+                            // 保存回 storage
+                            ariaNgStorageService.set(ariaNgConstants.optionStorageKey, currentOpts);
+                        }
+
+                        return secret;
+                    });
+                })();
             }
 
             return options;
@@ -730,6 +792,18 @@
                 }
 
                 onFirstVisitCallbacks.push(callback);
+            },
+            /**
+             * 返回 WebView2 secret 就绪的 promise
+             * - 非 WebView2 环境：返回 null
+             * - 需要等待：返回 secret 请求的 promise
+             * - 已就绪：返回已 resolve 的 promise
+             * 
+             * aria2RpcService 在发起 RPC 请求前调用此方法，
+             * 确保 secret 已加载完成后再发送请求，避免首次认证失败
+             */
+            whenWebView2SecretReady: function () {
+                return webView2SecretReadyPromise;
             }
         };
     }]);
